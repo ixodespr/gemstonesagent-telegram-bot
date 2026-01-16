@@ -1,12 +1,7 @@
 import os
 import json
 import logging
-import tempfile
-
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from datetime import datetime
 
 from telegram import Update
 from telegram.ext import (
@@ -14,175 +9,153 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
 )
 
-# -------------------------
-# LOGGING
-# -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 
-# -------------------------
-# ENV
-# -------------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-if not all([
-    TELEGRAM_TOKEN,
-    SPREADSHEET_ID,
-    GOOGLE_SERVICE_ACCOUNT_JSON,
-    GOOGLE_DRIVE_FOLDER_ID,
-]):
-    raise RuntimeError("Missing required env variables")
-
-# -------------------------
-# GOOGLE AUTH
-# -------------------------
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+# Состояния диалога
+WAIT_PHOTO, ASK_NAME, ASK_WEIGHT, ASK_COMMENT = range(4)
 
-creds = Credentials.from_service_account_info(
-    service_account_info,
-    scopes=SCOPES,
-)
 
-gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+def get_google_services():
+    creds = Credentials.from_service_account_info(
+        json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+        scopes=SCOPES,
+    )
+    drive = build("drive", "v3", credentials=creds)
+    sheets = build("sheets", "v4", credentials=creds)
+    return drive, sheets
 
-drive_service = build("drive", "v3", credentials=creds)
 
-# -------------------------
-# DATA FLOW
-# -------------------------
-FIELDS = [
-    ("name", "Название камня?"),
-    ("color", "Цвет?"),
-    ("shape", "Форма?"),
-    ("size_ct", "Размер (ct)?"),
-    ("origin", "Происхождение?"),
-    ("price", "Цена?"),
-]
-
-# -------------------------
-# COMMANDS
-# -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Бот добавления камней.\n"
-        "Команда: /add"
+        "Привет.\n\n"
+        "Я помогу зафиксировать новый камень.\n\n"
+        "Порядок действий:\n"
+        "1. Загрузи фото камня\n"
+        "2. Заполни информацию\n"
+        "3. Данные сохранятся в таблицу\n\n"
+        "Начинай. Пришли фото."
     )
+    return WAIT_PHOTO
 
 
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["step"] = 0
-    context.user_data["data"] = {}
-    await update.message.reply_text(FIELDS[0][1])
-
-# -------------------------
-# TEXT HANDLER
-# -------------------------
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("step")
-
-    if step is None or step >= len(FIELDS):
-        return
-
-    key, _ = FIELDS[step]
-    context.user_data["data"][key] = update.message.text.strip()
-    context.user_data["step"] = step + 1
-
-    if context.user_data["step"] < len(FIELDS):
-        await update.message.reply_text(
-            FIELDS[context.user_data["step"]][1]
-        )
-    else:
-        await update.message.reply_text("Пришли фото камня.")
-
-# -------------------------
-# PHOTO HANDLER
-# -------------------------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("step") != len(FIELDS):
-        await update.message.reply_text("Фото сейчас не нужно.")
-        return
+    drive, _ = get_google_services()
 
     photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
+    file = await photo.get_file()
+    file_bytes = await file.download_as_bytearray()
 
-    with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
-        await tg_file.download_to_drive(tmp.name)
-        image_url = upload_to_drive(tmp.name)
+    media = MediaInMemoryUpload(
+        file_bytes,
+        mimetype="image/jpeg",
+        resumable=False,
+    )
 
-    save_to_sheet(context.user_data["data"], image_url)
-    context.user_data.clear()
+    filename = f"stone_{datetime.utcnow().isoformat()}.jpg"
 
-    await update.message.reply_text("Камень сохранён.")
-
-# -------------------------
-# GOOGLE DRIVE
-# -------------------------
-def upload_to_drive(path: str) -> str:
-    metadata = {
-        "name": os.path.basename(path),
-        "parents": [GOOGLE_DRIVE_FOLDER_ID],
-    }
-
-    media = MediaFileUpload(path, mimetype="image/jpeg")
-
-    created = drive_service.files().create(
-        body=metadata,
+    uploaded = drive.files().create(
         media_body=media,
+        body={
+            "name": filename,
+            "parents": [DRIVE_FOLDER_ID],
+        },
         fields="id",
     ).execute()
 
-    drive_service.permissions().create(
-        fileId=created["id"],
-        body={
-            "type": "anyone",
-            "role": "reader",
-        },
+    context.user_data["photo_id"] = uploaded["id"]
+
+    await update.message.reply_text(
+        "Фото сохранено.\n\n"
+        "Теперь укажи название камня."
+    )
+    return ASK_NAME
+
+
+async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = update.message.text
+    await update.message.reply_text("Принял. Укажи вес камня.")
+    return ASK_WEIGHT
+
+
+async def ask_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["weight"] = update.message.text
+    await update.message.reply_text("Добавь комментарий или описание.")
+    return ASK_COMMENT
+
+
+async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["comment"] = update.message.text
+
+    _, sheets = get_google_services()
+
+    row = [
+        datetime.utcnow().isoformat(),
+        context.user_data["name"],
+        context.user_data["weight"],
+        context.user_data["comment"],
+        context.user_data["photo_id"],
+    ]
+
+    sheets.spreadsheets().values().append(
+        spreadsheetId=SHEET_ID,
+        range="A1",
+        valueInputOption="RAW",
+        body={"values": [row]},
     ).execute()
 
-    return f"https://drive.google.com/uc?id={created['id']}"
+    await update.message.reply_text(
+        "Готово.\n\n"
+        "Камень сохранён:\n"
+        f"Название: {context.user_data['name']}\n"
+        f"Вес: {context.user_data['weight']}\n\n"
+        "Можно добавлять следующий камень через /start"
+    )
 
-# -------------------------
-# GOOGLE SHEETS
-# -------------------------
-def save_to_sheet(data: dict, image_url: str):
-    sheet.append_row([
-        data.get("name"),
-        data.get("color"),
-        data.get("shape"),
-        data.get("size_ct"),
-        data.get("origin"),
-        data.get("price"),
-        image_url,
-    ])
+    context.user_data.clear()
+    return ConversationHandler.END
 
-# -------------------------
-# MAIN
-# -------------------------
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Процесс сброшен.")
+    return ConversationHandler.END
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            WAIT_PHOTO: [MessageHandler(filters.PHOTO, handle_photo)],
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
+            ASK_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_weight)],
+            ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_comment)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
 
-    logging.info("Bot started")
+    app.add_handler(conv)
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

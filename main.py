@@ -21,8 +21,8 @@ from telegram.ext import (
 # LOGGING
 # -------------------------
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 # -------------------------
@@ -33,14 +33,13 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
-for var in [
+if not all([
     TELEGRAM_TOKEN,
     SPREADSHEET_ID,
     GOOGLE_SERVICE_ACCOUNT_JSON,
     GOOGLE_DRIVE_FOLDER_ID,
-]:
-    if not var:
-        raise RuntimeError("Missing env variables")
+]):
+    raise RuntimeError("Missing required env variables")
 
 # -------------------------
 # GOOGLE AUTH
@@ -63,7 +62,7 @@ sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 drive_service = build("drive", "v3", credentials=creds)
 
 # -------------------------
-# STATES
+# DATA FLOW
 # -------------------------
 FIELDS = [
     ("name", "Название камня?"),
@@ -101,7 +100,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key, _ = FIELDS[step]
     context.user_data["data"][key] = update.message.text.strip()
-    context.user_data["step"] += 1
+    context.user_data["step"] = step + 1
 
     if context.user_data["step"] < len(FIELDS):
         await update.message.reply_text(
@@ -119,11 +118,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     photo = update.message.photo[-1]
-    file = await photo.get_file()
+    tg_file = await photo.get_file()
 
     with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
-        await file.download_to_drive(tmp.name)
-
+        await tg_file.download_to_drive(tmp.name)
         image_url = upload_to_drive(tmp.name)
 
     save_to_sheet(context.user_data["data"], image_url)
@@ -142,46 +140,49 @@ def upload_to_drive(path: str) -> str:
 
     media = MediaFileUpload(path, mimetype="image/jpeg")
 
-    file = drive_service.files().create(
+    created = drive_service.files().create(
         body=metadata,
         media_body=media,
         fields="id",
     ).execute()
-... 
-...     drive_service.permissions().create(
-...         fileId=file["id"],
-...         body={"type": "anyone", "role": "reader"},
-...     ).execute()
-... 
-...     return f"https://drive.google.com/uc?id={file['id']}"
-... 
-... # -------------------------
-... # GOOGLE SHEETS
-... # -------------------------
-... def save_to_sheet(data: dict, image_url: str):
-...     sheet.append_row([
-...         data.get("name"),
-...         data.get("color"),
-...         data.get("shape"),
-...         data.get("size_ct"),
-...         data.get("origin"),
-...         data.get("price"),
-...         image_url,
-...     ])
-... 
-... # -------------------------
-... # MAIN
-... # -------------------------
-... def main():
-...     app = Application.builder().token(TELEGRAM_TOKEN).build()
-... 
-...     app.add_handler(CommandHandler("start", start))
-...     app.add_handler(CommandHandler("add", add))
-...     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-...     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-... 
-...     app.run_polling()
-... 
-... 
-... if __name__ == "__main__":
-...     main()
+
+    drive_service.permissions().create(
+        fileId=created["id"],
+        body={
+            "type": "anyone",
+            "role": "reader",
+        },
+    ).execute()
+
+    return f"https://drive.google.com/uc?id={created['id']}"
+
+# -------------------------
+# GOOGLE SHEETS
+# -------------------------
+def save_to_sheet(data: dict, image_url: str):
+    sheet.append_row([
+        data.get("name"),
+        data.get("color"),
+        data.get("shape"),
+        data.get("size_ct"),
+        data.get("origin"),
+        data.get("price"),
+        image_url,
+    ])
+
+# -------------------------
+# MAIN
+# -------------------------
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    logging.info("Bot started")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()

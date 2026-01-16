@@ -17,19 +17,31 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
 
+# -------------------------
+# ЛОГИ
+# -------------------------
 logging.basicConfig(level=logging.INFO)
 
+# -------------------------
+# ENV
+# -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")  # ВАЖНО
+
+if not all([BOT_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON, DRIVE_FOLDER_ID, SHEET_ID, SHEET_NAME]):
+    raise RuntimeError("Не заданы все ENV переменные")
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# Состояния диалога
+# -------------------------
+# СОСТОЯНИЯ
+# -------------------------
 WAIT_PHOTO, ASK_NAME, ASK_WEIGHT, ASK_COMMENT = range(4)
 
 
@@ -43,15 +55,18 @@ def get_google_services():
     return drive, sheets
 
 
+# -------------------------
+# HANDLERS
+# -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет.\n\n"
-        "Я помогу зафиксировать новый камень.\n\n"
-        "Порядок действий:\n"
-        "1. Загрузи фото камня\n"
-        "2. Заполни информацию\n"
-        "3. Данные сохранятся в таблицу\n\n"
-        "Начинай. Пришли фото."
+        "Добавление нового камня.\n\n"
+        "Порядок:\n"
+        "1. Фото\n"
+        "2. Название\n"
+        "3. Вес\n"
+        "4. Комментарий\n\n"
+        "Пришли фото камня."
     )
     return WAIT_PHOTO
 
@@ -63,13 +78,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await photo.get_file()
     file_bytes = await file.download_as_bytearray()
 
+    filename = f"stone_{datetime.utcnow().isoformat()}.jpg"
+
     media = MediaInMemoryUpload(
         file_bytes,
         mimetype="image/jpeg",
         resumable=False,
     )
-
-    filename = f"stone_{datetime.utcnow().isoformat()}.jpg"
 
     uploaded = drive.files().create(
         media_body=media,
@@ -82,27 +97,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["photo_id"] = uploaded["id"]
 
-    await update.message.reply_text(
-        "Фото сохранено.\n\n"
-        "Теперь укажи название камня."
-    )
+    await update.message.reply_text("Фото сохранено. Введи название камня.")
     return ASK_NAME
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text
-    await update.message.reply_text("Принял. Укажи вес камня.")
+    context.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text("Принято. Укажи вес.")
     return ASK_WEIGHT
 
 
 async def ask_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["weight"] = update.message.text
-    await update.message.reply_text("Добавь комментарий или описание.")
+    context.user_data["weight"] = update.message.text.strip()
+    await update.message.reply_text("Добавь комментарий.")
     return ASK_COMMENT
 
 
 async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["comment"] = update.message.text
+    context.user_data["comment"] = update.message.text.strip()
 
     _, sheets = get_google_services()
 
@@ -114,19 +126,19 @@ async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["photo_id"],
     ]
 
-    sheets.spreadsheets().values().append(
+    result = sheets.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
-        range="A1",
+        range=f"{SHEET_NAME}!A:E",
         valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
         body={"values": [row]},
     ).execute()
 
+    logging.info(f"SHEETS APPEND RESULT: {result}")
+
     await update.message.reply_text(
-        "Готово.\n\n"
-        "Камень сохранён:\n"
-        f"Название: {context.user_data['name']}\n"
-        f"Вес: {context.user_data['weight']}\n\n"
-        "Можно добавлять следующий камень через /start"
+        "Готово.\n"
+        "Данные добавлены в таблицу в первую пустую строку."
     )
 
     context.user_data.clear()
@@ -135,11 +147,16 @@ async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Процесс сброшен.")
+    await update.message.reply_text("Добавление отменено.")
     return ConversationHandler.END
 
 
+# -------------------------
+# MAIN
+# -------------------------
 def main():
+    logging.info("Bot started")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(

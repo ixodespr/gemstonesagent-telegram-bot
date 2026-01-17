@@ -1,136 +1,139 @@
-import logging
 import os
 import json
+import logging
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-import gspread
-from google.oauth2.service_account import Credentials
-
-
-# ================== НАСТРОЙКИ ==================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_NAME = os.getenv("SHEET_NAME")
-
-
-# ================== ЛОГИ ==================
-
+# -------------------------
+# LOGGING
+# -------------------------
 logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
 
+# -------------------------
+# ENV — СТРОГО КАК В РАБОЧЕЙ ВЕРСИИ
+# -------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# ================== GOOGLE SHEETS ==================
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN не задан")
 
-def get_worksheet():
-    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+if not SPREADSHEET_ID:
+    raise RuntimeError("SPREADSHEET_ID не задан")
 
-    creds = Credentials.from_service_account_info(
-        creds_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON не задан")
 
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(SPREADSHEET_ID)
-    return sheet.worksheet(SHEET_NAME)
+# -------------------------
+# GOOGLE SHEETS
+# -------------------------
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
 
-def append_to_sheet(values: list):
-    ws = get_worksheet()
-    ws.append_row(values, value_input_option="USER_ENTERED")
+creds = Credentials.from_service_account_info(
+    service_account_info,
+    scopes=SCOPES,
+)
 
+gc = gspread.authorize(creds)
+sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
-# ================== BOT ЛОГИКА ==================
-
+# -------------------------
+# DATA STRUCTURE
+# -------------------------
 FIELDS = [
-    "name",
-    "type",
-    "origin",
-    "description",
+    ("name", "Название камня"),
+    ("color", "Цвет"),
+    ("shape", "Форма"),
+    ("size_ct", "Размер (ct)"),
+    ("origin", "Происхождение"),
+    ("clarity", "Чистота"),
+    ("price", "Цена"),
 ]
 
-
+# -------------------------
+# HANDLERS
+# -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["step"] = 0
 
     await update.message.reply_text(
-        "Добавляем новый камень.\n\n"
-        "Шаг 1 из 4.\n"
-        "Название камня:"
+        "Добавляем новый камень.\n"
+        "Отвечай по порядку.\n\n"
+        f"{FIELDS[0][1]}:"
     )
 
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     step = context.user_data.get("step", 0)
 
-    if step < len(FIELDS):
-        context.user_data[FIELDS[step]] = text
-        context.user_data["step"] = step + 1
-
-    step = context.user_data["step"]
-
-    if step == 1:
-        await update.message.reply_text(
-            "Шаг 2 из 4.\n"
-            "Тип камня:"
-        )
-
-    elif step == 2:
-        await update.message.reply_text(
-            "Шаг 3 из 4.\n"
-            "Происхождение:"
-        )
-
-    elif step == 3:
-        await update.message.reply_text(
-            "Шаг 4 из 4.\n"
-            "Описание:"
-        )
-
-    elif step == 4:
-        row = [context.user_data.get(f, "") for f in FIELDS]
-
-        append_to_sheet(row)
-
+    if step >= len(FIELDS):
+        await update.message.reply_text("Сессия сломалась. Напиши /start")
         context.user_data.clear()
-        context.user_data["step"] = 0
+        return
 
-        await update.message.reply_text(
-            "Записано в таблицу.\n\n"
-            "Можно добавлять следующий камень.\n"
-            "Введи название:"
-        )
+    key, label = FIELDS[step]
+    context.user_data[key] = update.message.text.strip()
+    context.user_data["step"] = step + 1
 
+    # Если есть следующий вопрос
+    if context.user_data["step"] < len(FIELDS):
+        next_label = FIELDS[context.user_data["step"]][1]
+        await update.message.reply_text(f"{next_label}:")
+        return
 
-# ================== MAIN ==================
+    # -------------------------
+    # SAVE TO GOOGLE SHEET
+    # -------------------------
+    row = [
+        context.user_data.get("name", ""),
+        context.user_data.get("color", ""),
+        context.user_data.get("shape", ""),
+        context.user_data.get("size_ct", ""),
+        context.user_data.get("origin", ""),
+        context.user_data.get("clarity", ""),
+        context.user_data.get("price", ""),
+    ]
 
+    sheet.append_row(row, value_input_option="USER_ENTERED")
+
+    await update.message.reply_text(
+        "Готово. Камень записан в таблицу.\n\n"
+        "Для добавления следующего — /start"
+    )
+
+    context.user_data.clear()
+
+# -------------------------
+# MAIN
+# -------------------------
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    logging.info("BOT STARTING")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
 
-    logger.info("Bot started")
+    logging.info("BOT POLLING")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()

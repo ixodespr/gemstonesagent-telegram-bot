@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 
 from telegram import Update
 from telegram.ext import (
@@ -11,7 +12,7 @@ from telegram.ext import (
 )
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 
 # ================== НАСТРОЙКИ ==================
@@ -21,8 +22,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 SHEET_NAME = os.getenv("SHEET_NAME")
-
-# НИКАКИХ RuntimeError. Если что-то не задано — gspread сам упадёт.
 
 
 # ================== ЛОГИ ==================
@@ -37,13 +36,15 @@ logger = logging.getLogger(__name__)
 # ================== GOOGLE SHEETS ==================
 
 def get_worksheet():
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
 
-    creds_dict = eval(GOOGLE_CREDENTIALS_JSON)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    creds = Credentials.from_service_account_info(
+        creds_info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
 
     client = gspread.authorize(creds)
     sheet = client.open_by_key(SPREADSHEET_ID)
@@ -57,7 +58,7 @@ def append_to_sheet(values: list):
 
 # ================== BOT ЛОГИКА ==================
 
-USER_DATA_KEYS = [
+FIELDS = [
     "name",
     "type",
     "origin",
@@ -70,9 +71,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["step"] = 0
 
     await update.message.reply_text(
-        "Привет. Давай добавим новый камень.\n\n"
+        "Добавляем новый камень.\n\n"
         "Шаг 1 из 4.\n"
-        "Напиши название камня."
+        "Название камня:"
     )
 
 
@@ -80,9 +81,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     step = context.user_data.get("step", 0)
 
-    if step < len(USER_DATA_KEYS):
-        key = USER_DATA_KEYS[step]
-        context.user_data[key] = text
+    if step < len(FIELDS):
+        context.user_data[FIELDS[step]] = text
         context.user_data["step"] = step + 1
 
     step = context.user_data["step"]
@@ -90,40 +90,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == 1:
         await update.message.reply_text(
             "Шаг 2 из 4.\n"
-            "Тип камня (драгоценный / полудрагоценный / минерал и т.д.)"
+            "Тип камня:"
         )
 
     elif step == 2:
         await update.message.reply_text(
             "Шаг 3 из 4.\n"
-            "Происхождение (страна, регион, месторождение)"
+            "Происхождение:"
         )
 
     elif step == 3:
         await update.message.reply_text(
             "Шаг 4 из 4.\n"
-            "Краткое описание камня"
+            "Описание:"
         )
 
     elif step == 4:
-        values = [
-            context.user_data.get("name", ""),
-            context.user_data.get("type", ""),
-            context.user_data.get("origin", ""),
-            context.user_data.get("description", ""),
-        ]
+        row = [context.user_data.get(f, "") for f in FIELDS]
 
-        append_to_sheet(values)
+        append_to_sheet(row)
 
         context.user_data.clear()
+        context.user_data["step"] = 0
 
         await update.message.reply_text(
-            "Готово. Камень добавлен в таблицу.\n\n"
-            "Можно начинать новый ввод.\n"
-            "Напиши название следующего камня."
+            "Записано в таблицу.\n\n"
+            "Можно добавлять следующий камень.\n"
+            "Введи название:"
         )
-
-        context.user_data["step"] = 0
 
 
 # ================== MAIN ==================

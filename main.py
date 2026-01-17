@@ -15,7 +15,6 @@ from telegram.ext import (
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
 
 # -------------------------
 # ЛОГИ
@@ -30,14 +29,12 @@ logging.basicConfig(
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 
 if not all([
     BOT_TOKEN,
     GOOGLE_SERVICE_ACCOUNT_JSON,
-    GOOGLE_DRIVE_FOLDER_ID,
     GOOGLE_SHEET_ID,
     GOOGLE_SHEET_NAME,
 ]):
@@ -46,92 +43,40 @@ if not all([
 # -------------------------
 # GOOGLE SCOPES
 # -------------------------
-SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # -------------------------
 # STATES
 # -------------------------
-WAIT_PHOTO, ASK_NAME, ASK_WEIGHT, ASK_COMMENT = range(4)
+ASK_NAME, ASK_WEIGHT, ASK_COMMENT = range(3)
 
 
 # -------------------------
-# GOOGLE SERVICES
+# GOOGLE
 # -------------------------
-def get_google_services():
+def get_sheets_service():
     creds = Credentials.from_service_account_info(
         json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
         scopes=SCOPES,
     )
-    drive = build("drive", "v3", credentials=creds)
-    sheets = build("sheets", "v4", credentials=creds)
-    return drive, sheets
+    return build("sheets", "v4", credentials=creds)
 
 
 # -------------------------
 # HANDLERS
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+
     await update.message.reply_text(
         "Добавление нового камня.\n\n"
-        "Порядок:\n"
-        "1. Фото камня\n"
-        "2. Название\n"
-        "3. Вес\n"
-        "4. Комментарий\n\n"
-        "Пришли фото камня."
+        "Шаги:\n"
+        "1. Название\n"
+        "2. Вес\n"
+        "3. Комментарий\n\n"
+        "Введи название камня."
     )
-    return WAIT_PHOTO
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        drive, _ = get_google_services()
-
-        photo = update.message.photo[-1]
-        tg_file = await photo.get_file()
-        file_bytes = await tg_file.download_as_bytearray()
-
-        filename = f"stone_{datetime.utcnow().isoformat()}.jpg"
-
-        media = MediaInMemoryUpload(
-            file_bytes,
-            mimetype="image/jpeg",
-            resumable=False,
-        )
-
-        logging.info(f"Uploading photo to Drive folder {GOOGLE_DRIVE_FOLDER_ID}")
-
-        uploaded = drive.files().create(
-            media_body=media,
-            body={
-                "name": filename,
-                "parents": [GOOGLE_DRIVE_FOLDER_ID],
-            },
-            fields="id",
-        ).execute()
-
-        context.user_data["photo_id"] = uploaded["id"]
-
-        logging.info(f"Photo uploaded successfully, id={uploaded['id']}")
-
-        await update.message.reply_text(
-            "Фото сохранено.\n"
-            "Теперь введи название камня."
-        )
-        return ASK_NAME
-
-    except Exception as e:
-        logging.exception("DRIVE UPLOAD ERROR")
-
-        await update.message.reply_text(
-            "Ошибка при сохранении фото в Google Drive.\n\n"
-            f"{str(e)[:300]}"
-        )
-        context.user_data.clear()
-        return ConversationHandler.END
+    return ASK_NAME
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -150,50 +95,49 @@ async def ask_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["comment"] = update.message.text.strip()
 
     try:
-        _, sheets = get_google_services()
+        sheets = get_sheets_service()
 
         row = [
             datetime.utcnow().isoformat(),
             context.user_data.get("name"),
             context.user_data.get("weight"),
             context.user_data.get("comment"),
-            context.user_data.get("photo_id"),
         ]
 
-        logging.info(f"Appending row to sheet: {row}")
+        logging.info(f"Appending row: {row}")
 
-        result = sheets.spreadsheets().values().append(
+        sheets.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{GOOGLE_SHEET_NAME}!A:E",
+            range=f"{GOOGLE_SHEET_NAME}!A:D",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
         ).execute()
 
-        logging.info(f"SHEETS SUCCESS: {result}")
-
         await update.message.reply_text(
-            "Готово.\n\n"
-            "Фото сохранено в Google Drive.\n"
-            "Данные добавлены в таблицу."
+            "Готово.\n"
+            "Данные добавлены в таблицу.\n\n"
+            "Можно добавлять следующий камень.\n"
+            "Введи название."
         )
 
     except Exception as e:
-        logging.exception("SHEETS WRITE ERROR")
-
+        logging.exception("SHEETS ERROR")
         await update.message.reply_text(
-            "Фото сохранено, но возникла ошибка при записи в таблицу.\n\n"
+            "Ошибка при записи в таблицу.\n\n"
             f"{str(e)[:300]}"
         )
-
-    finally:
         context.user_data.clear()
         return ConversationHandler.END
+
+    # очистка кеша и новый круг
+    context.user_data.clear()
+    return ASK_NAME
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Процесс добавления отменён.")
+    await update.message.reply_text("Процесс отменён.")
     return ConversationHandler.END
 
 
@@ -201,14 +145,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # -------------------------
 def main():
-    logging.info("Bot starting")
+    logging.info("Bot started")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            WAIT_PHOTO: [MessageHandler(filters.PHOTO, handle_photo)],
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
             ASK_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_weight)],
             ASK_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_comment)],
@@ -216,7 +159,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(conv_handler)
+    app.add_handler(conv)
     app.run_polling()
 
 
